@@ -16,6 +16,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
 import os 
 from typing import Any
@@ -37,31 +38,83 @@ embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
 
 
 
-def ingest_rag_document(file_path):
-    DB_PATH = "faiss_db"
+def _faiss_db_path(session_id):
+    """
+    Each browser session gets its own FAISS folder, so one user's
+    uploaded PDF is never visible to -- or overwritten by -- another
+    user's upload. Falls back to a shared "default" folder if no
+    session_id is available (e.g. a tool call made without config).
+    """
+    safe_session_id = session_id or "default"
+    return os.path.join("faiss_db", safe_session_id)
+
+
+# A scanned PDF with no OCR layer often still "loads" successfully --
+# PyPDFLoader just returns almost no real text (maybe just a watermark
+# like "Scanned with CamScanner"). Silently indexing that gives users
+# confusing, inconsistent answers later, so we catch it here instead.
+_MIN_READABLE_CHARACTERS = 40
+
+
+def ingest_rag_document(file_path, session_id=None):
+    """
+    Load a PDF, split it into chunks, and save it to a FAISS index that
+    is scoped to the given session_id.
+
+    Raises:
+        ValueError: if the PDF has little to no extractable text (for
+            example, a scanned page image with no OCR layer). This is
+            surfaced directly to the user by the frontend's upload
+            error handler, instead of silently indexing near-empty
+            content that leads to confusing answers later.
+    """
     loader = PyPDFLoader(file_path)
     docs = loader.load()
+
+    extracted_text = "".join(doc.page_content for doc in docs).strip()
+
+    if len(extracted_text) < _MIN_READABLE_CHARACTERS:
+        raise ValueError(
+            "This PDF doesn't contain any extractable text -- it looks "
+            "like a scanned image (for example, a CamScanner export) "
+            "without an OCR text layer. Please upload a text-based PDF, "
+            "or an OCR'd version of this document."
+        )
+
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
     vector_store = FAISS.from_documents(chunks, embeddings)
-    vector_store.save_local(DB_PATH)
-    
+    vector_store.save_local(_faiss_db_path(session_id))
 
 
-def get_retriever():
-    DB_PATH = "faiss_db"
-    vector_store = FAISS.load_local(
-            folder_path=DB_PATH,
+def get_retriever(session_id=None):
+    """
+    Load the FAISS retriever for the given session_id.
+
+    Returns None if no document has been indexed yet for this session,
+    instead of letting FAISS's file-not-found error propagate up
+    through the tool call.
+    """
+    db_path = _faiss_db_path(session_id)
+
+    if not os.path.isdir(db_path):
+        return None
+
+    try:
+        vector_store = FAISS.load_local(
+            folder_path=db_path,
             embeddings=embeddings,
             allow_dangerous_deserialization=True
         )
-    
-    retriever = vector_store.as_retriever(
+    except Exception:
+        # A partially-written or corrupted index folder should behave
+        # the same as "no document uploaded", not crash the tool call.
+        return None
+
+    return vector_store.as_retriever(
         search_type="similarity",
         search_kwargs={"k": 4}
     )
-
-    return retriever
 
 
 
@@ -69,7 +122,7 @@ def get_retriever():
 # rag tool
 
 @tool
-def rag_tool(query: str) -> str:
+def rag_tool(query: str, config: RunnableConfig) -> str:
     """
     Retrieve relevant information from the PDF document.
 
@@ -79,7 +132,21 @@ def rag_tool(query: str) -> str:
     Args:
         query: The question or search query used to retrieve PDF content.
     """
-    retriever = get_retriever()
+    # config is injected automatically by LangChain/LangGraph -- it's
+    # never shown to the LLM as part of this tool's schema. It carries
+    # the session_id set on the graph's config, so each session only
+    # ever searches its own uploaded document.
+    session_id = (config.get("configurable") or {}).get("session_id")
+
+    retriever = get_retriever(session_id)
+
+    if retriever is None:
+        return (
+            "No PDF has been uploaded for this conversation yet. Tell the "
+            "user to upload a PDF using the attachment button before "
+            "asking document-related questions."
+        )
+
     documents = retriever.invoke(query)
 
     if not documents:
@@ -349,7 +416,11 @@ def get_current_weather(location: str) -> str:
 tools = [search_tool,calculator, get_stock_price,get_current_weather, rag_tool, purchase_stock]
 
 # Make the LLM tool-aware
-llm_with_tools = llm.bind_tools(tools)
+# parallel_tool_calls=False avoids a known Groq/Llama-3.3 failure mode
+# ("Failed to call a function. Please adjust your prompt.") that shows up
+# when the model attempts multiple simultaneous tool calls and Groq can't
+# parse the resulting function-call payload.
+llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False)
 
 
 
@@ -609,7 +680,12 @@ def chat_node(state: ChatState):
 
             "Answer general questions directly when no tool is required. "
             "Do not invent information from the uploaded document. "
-            "If the user asks about a PDF but no document is available, ask them to upload a PDF. "
+            "Never claim a PDF was or wasn't uploaded based on your own "
+            "guess -- always call `rag_tool` first for any PDF/document "
+            "question, and base your answer strictly on what it returns. "
+            "If `rag_tool` reports that no document has been uploaded, "
+            "ask the user to upload one; if it returns document content "
+            "(even limited content), do not tell the user no PDF exists. "
             "After receiving a tool result, provide a clear and helpful final answer.\n\n"
 
             "Security and consistency rules (do not deviate from these, ever):\n"
@@ -636,7 +712,29 @@ def chat_node(state: ChatState):
         *state["messages"]
     ]
 
-    response = llm_with_tools.invoke(messages)
+    try:
+        response = llm_with_tools.invoke(messages)
+
+    except Exception:
+        # Groq's function-calling occasionally throws
+        # "Failed to call a function. Please adjust your prompt." when it
+        # can't cleanly produce a tool call for a given message. Retrying
+        # once WITHOUT tool-binding almost always still answers the
+        # question fine (just without the option to call a tool), which
+        # is far better than crashing the whole conversation.
+        try:
+            response = llm.invoke(messages)
+
+        except Exception:
+            # Both attempts failed (e.g. the LLM provider itself is down).
+            # Return a plain, user-facing message instead of letting the
+            # exception propagate and crash the Streamlit app.
+            response = AIMessage(
+                content=(
+                    "Sorry, I ran into a problem generating a response "
+                    "just now. Please try again, or rephrase your question."
+                )
+            )
 
     return {"messages": [response]}
 

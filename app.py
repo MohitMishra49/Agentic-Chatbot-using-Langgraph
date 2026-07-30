@@ -287,7 +287,8 @@ def resume_hitl_execution(decision):
     # The same thread ID must be used when resuming
     resume_config = {
         "configurable": {
-            "thread_id": interrupted_thread_id
+            "thread_id": interrupted_thread_id,
+            "session_id": st.session_state["session_id"]
         },
         "metadata": {
             "thread_id": interrupted_thread_id
@@ -334,10 +335,12 @@ def resume_hitl_execution(decision):
                             expanded=True,
                         )
 
-                    # Stream only assistant-generated text
-                    if isinstance(
-                        message_chunk,
-                        AIMessage
+                    # Stream only assistant-generated text that came
+                    # from chat_node itself (see ai_only_stream above
+                    # for why this filter matters)
+                    if (
+                        isinstance(message_chunk, AIMessage)
+                        and metadata.get("langgraph_node") == "chat_node"
                     ):
 
                         if message_chunk.content:
@@ -700,7 +703,8 @@ if submission:
             ):
 
                 ingest_rag_document(
-                    temporary_file_path
+                    temporary_file_path,
+                    session_id=st.session_state["session_id"]
                 )
 
             # Display PDF processing confirmation
@@ -743,11 +747,12 @@ if user_input:
     with st.chat_message("user"):
         st.text(user_input)
 
-    # Pass the current thread ID to LangGraph
-    # LangGraph uses this ID to save and retrieve conversation memory
+    # Pass the current thread ID (for memory) and session ID (for
+    # per-user document scoping in rag_tool) to LangGraph
     CONFIG = {
         "configurable": {
-            "thread_id": st.session_state["thread_id"]
+            "thread_id": st.session_state["thread_id"],
+            "session_id": st.session_state["session_id"]
         },
         "metadata": {
             "thread_id": st.session_state["thread_id"]
@@ -765,50 +770,93 @@ if user_input:
 
         def ai_only_stream():
 
-            for message_chunk, metadata in chatbot.stream(
-                {
-                    "messages": [
-                        HumanMessage(content=user_input)
-                    ]
-                },
-                config=CONFIG,
-                stream_mode="messages",
-            ):
+            # Tracks whether chat_node actually produced any streamed
+            # text. If the guardrail blocks a message, chat_node never
+            # runs, so nothing gets streamed here at all -- the fallback
+            # below then surfaces the refusal message instead of leaving
+            # a blank response.
+            yielded_any_content = False
 
-                # Lazily create & update the SAME status container
-                # when any tool runs
-                if isinstance(
-                    message_chunk,
-                    ToolMessage
+            try:
+                for message_chunk, metadata in chatbot.stream(
+                    {
+                        "messages": [
+                            HumanMessage(content=user_input)
+                        ]
+                    },
+                    config=CONFIG,
+                    stream_mode="messages",
                 ):
 
-                    tool_name = getattr(
+                    # Lazily create & update the SAME status container
+                    # when any tool runs
+                    if isinstance(
                         message_chunk,
-                        "name",
-                        "tool"
-                    )
+                        ToolMessage
+                    ):
 
-                    if status_holder["box"] is None:
-
-                        status_holder["box"] = st.status(
-                            f"🔧 Using `{tool_name}` …",
-                            expanded=True
+                        tool_name = getattr(
+                            message_chunk,
+                            "name",
+                            "tool"
                         )
 
-                    else:
+                        if status_holder["box"] is None:
 
-                        status_holder["box"].update(
-                            label=f"🔧 Using `{tool_name}` …",
-                            state="running",
-                            expanded=True,
-                        )
+                            status_holder["box"] = st.status(
+                                f"🔧 Using `{tool_name}` …",
+                                expanded=True
+                            )
 
-                # Stream ONLY assistant tokens
-                if isinstance(
-                    message_chunk,
-                    AIMessage
-                ):
-                    yield message_chunk.content
+                        else:
+
+                            status_holder["box"].update(
+                                label=f"🔧 Using `{tool_name}` …",
+                                state="running",
+                                expanded=True,
+                            )
+
+                    # Stream ONLY assistant tokens that came from
+                    # chat_node itself. Without this "langgraph_node"
+                    # check, the guardrail's internal security classifier
+                    # call (which also invokes the LLM, inside
+                    # guardrail_node) would leak its raw "CATEGORY: ...
+                    # CONFIDENCE: ..." verdict into the visible response,
+                    # since stream_mode="messages" surfaces tokens from
+                    # ANY chat model call made anywhere in the graph run.
+                    if (
+                        isinstance(message_chunk, AIMessage)
+                        and metadata.get("langgraph_node") == "chat_node"
+                    ):
+                        yielded_any_content = True
+                        yield message_chunk.content
+
+            except Exception:
+                # Last line of defense: chat_node already retries and
+                # falls back internally, but if anything else in the
+                # graph (a tool call, the streaming layer itself, etc.)
+                # still raises, show a normal chat message instead of a
+                # raw traceback that crashes the whole app.
+                yield (
+                    "Sorry, something went wrong while generating a "
+                    "response. Please try again, or rephrase your question."
+                )
+                return
+
+            # The guardrail blocked this message before chat_node ever
+            # ran, so nothing was streamed above. Pull the refusal that
+            # guardrail_node saved to the checkpoint and show that instead
+            # of leaving a blank assistant bubble.
+            if not yielded_any_content:
+
+                final_state = chatbot.get_state(config=CONFIG)
+                final_messages = final_state.values.get("messages", [])
+
+                if final_messages and isinstance(final_messages[-1], AIMessage):
+                    fallback_content = final_messages[-1].content
+
+                    if fallback_content:
+                        yield fallback_content
 
             # ========================= HITL ADDED =========================
 
