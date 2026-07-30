@@ -1,4 +1,4 @@
- name: Streamlit AWS CI/CD
+name: Streamlit AWS CI/CD
 
 on:
   push:
