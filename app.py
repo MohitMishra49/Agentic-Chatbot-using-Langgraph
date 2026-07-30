@@ -3,6 +3,7 @@ from backend import (
     get_all_threads,
     get_last_human_message,
     delete_thread,
+    register_thread,
     ingest_rag_document
 )
 
@@ -26,6 +27,28 @@ def generate_thread_id():
     return str(uuid.uuid4())
 
 
+# ========================= Multi-user session isolation =========================
+# Every browser tab gets its own session_id. It's stored in the page's URL
+# query params (not just st.session_state) so a page REFRESH keeps the same
+# session_id -- st.session_state alone would not survive a hard reload.
+# Opening the app fresh (no "sid" in the URL) always creates a brand new,
+# independent session, e.g. a different browser or device.
+def init_session_id():
+    if "session_id" in st.session_state:
+        return st.session_state["session_id"]
+
+    existing_sid = st.query_params.get("sid")
+
+    if existing_sid:
+        session_id = existing_sid
+    else:
+        session_id = str(uuid.uuid4())
+        st.query_params["sid"] = session_id
+
+    st.session_state["session_id"] = session_id
+    return session_id
+
+
 # Add a new thread ID to the conversation list
 def add_thread(thread_id):
 
@@ -35,6 +58,10 @@ def add_thread(thread_id):
         # Insert at the front so the newest conversation is always
         # shown first in the sidebar, like ChatGPT / Claude
         st.session_state["chat_threads"].insert(0, thread_id)
+
+    # Scope this thread to the current browser session so no other
+    # visitor's sidebar or history can ever include it
+    register_thread(thread_id, st.session_state["session_id"])
 
 
 # ========================= Chat title helpers =========================
@@ -379,6 +406,11 @@ st.set_page_config(
 st.title("Agentic Chatbot with LangGraph")
 
 
+# Establish this visitor's session_id before anything thread-related,
+# since every thread lookup/creation below is scoped to it
+init_session_id()
+
+
 # Create message_history when the app runs for the first time
 if "message_history" not in st.session_state:
     st.session_state["message_history"] = []
@@ -389,9 +421,10 @@ if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
 
 
-# Create a list for storing all conversation thread IDs
+# Create a list for storing all conversation thread IDs, scoped to this
+# visitor's session only -- never another visitor's conversations
 if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = get_all_threads()
+    st.session_state["chat_threads"] = get_all_threads(st.session_state["session_id"])
 
 
 # ========================= HITL ADDED =========================
