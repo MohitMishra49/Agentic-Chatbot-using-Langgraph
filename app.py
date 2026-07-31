@@ -707,7 +707,9 @@ if submission:
 
                 ingest_rag_document(
                     temporary_file_path,
-                    session_id=st.session_state["session_id"]
+                    session_id=st.session_state["session_id"],
+                    thread_id=st.session_state["thread_id"],
+                    filename=uploaded_pdf.name
                 )
 
             # Display PDF processing confirmation

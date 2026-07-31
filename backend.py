@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 import logging
 import sys
 import traceback
+import uuid
 
 
 load_dotenv()
@@ -100,10 +101,28 @@ def _has_indexed_document(session_id):
 _MIN_READABLE_CHARACTERS = 40
 
 
-def ingest_rag_document(file_path, session_id=None):
+def ingest_rag_document(file_path, session_id=None, thread_id=None, filename=None):
     """
-    Load a PDF, split it into chunks, and save it to a FAISS index that
-    is scoped to the given session_id.
+    Load a PDF, split it into chunks, tag every chunk with a unique
+    document_id (+ session_id/thread_id/filename/upload_timestamp), and
+    add it to the FAISS index for this session.
+
+    IMPORTANT -- this is additive, not destructive: previously uploaded
+    PDFs in this session stay in the index and stay retrievable (a
+    document is never deleted just because a new one was uploaded).
+    Documents are told apart purely by the document_id tag on each
+    chunk's metadata. `rag_tool` then filters retrieval down to only
+    the chunks belonging to the document that is "active" for the
+    current thread_id -- see `get_active_document` / `set_active_document`
+    below -- which is what actually fixes PDF A's chunks leaking into
+    an answer about PDF B.
+
+    The active-document pointer for `thread_id` is only flipped to this
+    new document_id AFTER the FAISS index has been embedded and durably
+    saved to disk (see the `set_active_document` call at the very end).
+    That ordering guarantees a newly uploaded PDF is always fully
+    indexed before it can ever be retrieved -- if anything below raises,
+    the thread's previous active document (if any) is left untouched.
 
     Raises:
         ValueError: if the PDF has little to no extractable text (for
@@ -111,13 +130,29 @@ def ingest_rag_document(file_path, session_id=None):
             surfaced directly to the user by the frontend's upload
             error handler, instead of silently indexing near-empty
             content that leads to confusing answers later.
+
+    Returns:
+        The newly generated document_id (str).
     """
+    display_filename = filename or os.path.basename(file_path)
+    document_id = str(uuid.uuid4())
+    upload_timestamp = datetime.now(timezone.utc).isoformat()
+
+    logger.info(
+        "INGEST | started | filename=%s | document_id=%s | session_id=%s | thread_id=%s",
+        display_filename, document_id, session_id, thread_id,
+    )
+
     loader = PyPDFLoader(file_path)
     docs = loader.load()
 
     extracted_text = "".join(doc.page_content for doc in docs).strip()
 
     if len(extracted_text) < _MIN_READABLE_CHARACTERS:
+        logger.warning(
+            "INGEST | rejected (no extractable text) | filename=%s | document_id=%s",
+            display_filename, document_id,
+        )
         raise ValueError(
             "This PDF doesn't contain any extractable text -- it looks "
             "like a scanned image (for example, a CamScanner export) "
@@ -127,13 +162,83 @@ def ingest_rag_document(file_path, session_id=None):
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
-    vector_store = FAISS.from_documents(chunks, embeddings)
-    vector_store.save_local(_faiss_db_path(session_id))
+
+    # Tag every chunk with the identifiers needed to isolate this PDF
+    # from every other PDF that may already be sitting in this same
+    # session's FAISS index.
+    for chunk in chunks:
+        chunk.metadata.update({
+            "document_id": document_id,
+            "session_id": session_id or "default",
+            "thread_id": thread_id,
+            "filename": display_filename,
+            "upload_timestamp": upload_timestamp,
+        })
+
+    logger.info(
+        "INGEST | chunks created | filename=%s | document_id=%s | chunk_count=%d",
+        display_filename, document_id, len(chunks),
+    )
+
+    db_path = _faiss_db_path(session_id)
+
+    try:
+        if os.path.isdir(db_path):
+            # Merge into the session's existing index instead of
+            # overwriting it, so earlier PDFs stay retrievable (e.g. if
+            # the user later explicitly asks about one of them) rather
+            # than being wiped out by every new upload.
+            vector_store = FAISS.load_local(
+                folder_path=db_path,
+                embeddings=embeddings,
+                allow_dangerous_deserialization=True,
+            )
+            vector_store.add_documents(chunks)
+        else:
+            vector_store = FAISS.from_documents(chunks, embeddings)
+
+        # embed_documents runs once per chunk under the hood in both
+        # from_documents() and add_documents(), so embedding count ==
+        # chunk count here.
+        logger.info(
+            "INGEST | embeddings generated | filename=%s | document_id=%s | embedding_count=%d",
+            display_filename, document_id, len(chunks),
+        )
+
+        vector_store.save_local(db_path)
+
+        logger.info(
+            "INGEST | vector store insertion status=SUCCESS | filename=%s | document_id=%s | path=%s",
+            display_filename, document_id, db_path,
+        )
+
+    except Exception:
+        logger.exception(
+            "INGEST | vector store insertion status=FAILED | filename=%s | document_id=%s",
+            display_filename, document_id,
+        )
+        raise
+
+    # Only now -- after the index is durably saved -- register the
+    # document and flip this thread's active-document pointer.
+    register_document(
+        document_id=document_id,
+        session_id=session_id or "default",
+        thread_id=thread_id,
+        filename=display_filename,
+        upload_timestamp=upload_timestamp,
+        chunk_count=len(chunks),
+    )
+
+    if thread_id:
+        set_active_document(thread_id, document_id)
+
+    return document_id
 
 
-def get_retriever(session_id=None):
+def _load_vector_store(session_id):
     """
-    Load the FAISS retriever for the given session_id.
+    Load the FAISS vector store for the given session_id.
 
     Returns None if no document has been indexed yet for this session,
     instead of letting FAISS's file-not-found error propagate up
@@ -145,7 +250,7 @@ def get_retriever(session_id=None):
         return None
 
     try:
-        vector_store = FAISS.load_local(
+        return FAISS.load_local(
             folder_path=db_path,
             embeddings=embeddings,
             allow_dangerous_deserialization=True
@@ -153,12 +258,10 @@ def get_retriever(session_id=None):
     except Exception:
         # A partially-written or corrupted index folder should behave
         # the same as "no document uploaded", not crash the tool call.
+        logger.exception(
+            "RETRIEVAL | failed to load FAISS index | session_id=%s", session_id
+        )
         return None
-
-    return vector_store.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 4}
-    )
 
 
 
@@ -168,43 +271,100 @@ def get_retriever(session_id=None):
 @tool
 def rag_tool(query: str, config: RunnableConfig) -> str:
     """
-    Retrieve relevant information from the PDF document.
+    Retrieve relevant information from the PDF document that is
+    currently active in this conversation.
 
     Use this tool when the user asks factual or conceptual questions
-    that may be answered using the stored PDF documents.
+    that may be answered using the uploaded PDF.
 
     Args:
         query: The question or search query used to retrieve PDF content.
     """
     # config is injected automatically by LangChain/LangGraph -- it's
-    # never shown to the LLM as part of this tool's schema. It carries
-    # the session_id set on the graph's config, so each session only
-    # ever searches its own uploaded document.
-    session_id = (config.get("configurable") or {}).get("session_id")
+    # never shown to the LLM as part of this tool's schema.
+    #   session_id -> which browser session's FAISS index to open
+    #                 (never another visitor's).
+    #   thread_id  -> which document is "active" for THIS conversation
+    #                 right now (never a stale/previous upload's chunks).
+    configurable = config.get("configurable") or {}
+    session_id = configurable.get("session_id")
+    thread_id = configurable.get("thread_id")
 
-    retriever = get_retriever(session_id)
+    active_document = get_active_document(thread_id)
 
-    if retriever is None:
+    if active_document is None:
+        logger.info(
+            "RETRIEVAL | no active document | session_id=%s | thread_id=%s",
+            session_id, thread_id,
+        )
         return (
             "No PDF has been uploaded for this conversation yet. Tell the "
             "user to upload a PDF using the attachment button before "
             "asking document-related questions."
         )
 
-    documents = retriever.invoke(query)
+    active_document_id = active_document["document_id"]
+    active_filename = active_document["filename"]
+
+    vector_store = _load_vector_store(session_id)
+
+    if vector_store is None:
+        logger.warning(
+            "RETRIEVAL | active document is registered but the vector "
+            "store is missing/corrupt | session_id=%s | thread_id=%s | "
+            "document_id=%s",
+            session_id, thread_id, active_document_id,
+        )
+        return (
+            "I couldn't load the indexed content for this document. "
+            "Please try re-uploading the PDF."
+        )
+
+    retrieval_filter = {"document_id": active_document_id}
+    logger.info(
+        "RETRIEVAL | query=%s | filter=%s | active_filename=%s",
+        _truncate(query, 150), retrieval_filter, active_filename,
+    )
+
+    # Over-fetch broadly, then filter down to ONLY the chunks tagged
+    # with the active document_id. Filtering client-side (rather than
+    # relying on FAISS's optional `filter=` kwarg, whose support varies
+    # by langchain-community version) is what actually guarantees a
+    # previously uploaded PDF in this same session can never leak into
+    # the answer for the document the user is currently asking about.
+    candidate_documents = vector_store.similarity_search(query, k=20)
+
+    documents = [
+        doc for doc in candidate_documents
+        if doc.metadata.get("document_id") == active_document_id
+    ][:4]
+
+    retrieved_ids = [doc.metadata.get("document_id") for doc in documents]
+    retrieved_filenames = [doc.metadata.get("filename") for doc in documents]
+
+    logger.info(
+        "RETRIEVAL | retrieved_chunk_count=%d | retrieved_document_ids=%s | "
+        "retrieved_filenames=%s",
+        len(documents), retrieved_ids, retrieved_filenames,
+    )
 
     if not documents:
-        return "No relevant information was found in the PDF."
+        # Deliberately do NOT fall back to unfiltered / stale results
+        # from another document -- a clear "nothing found" beats a
+        # confident-sounding wrong-document answer.
+        return (
+            f"No relevant information was found in the currently active "
+            f"document ({active_filename}) for that question."
+        )
 
     formatted_documents = []
 
     for index, document in enumerate(documents, start=1):
-        source = document.metadata.get("source", "Unknown source")
         page = document.metadata.get("page", "Unknown page")
 
         formatted_documents.append(
             f"Document {index}\n"
-            f"Source: {source}\n"
+            f"Source: {active_filename}\n"
             f"Page: {page}\n"
             f"Content: {document.page_content}"
         )
@@ -253,14 +413,24 @@ def search_tool(query: str) -> str:
       of something
     - anything the user explicitly flags as "latest", "current", "today",
       "now", or "recent"
+    - ANY question tied to a specific year, date, tournament, election, or
+      scheduled event (e.g. "who won the FIFA World Cup 2026", "who won the
+      election in [year]", "who is the champion of [tournament] this year").
+      For these, ALWAYS search even if you believe -- based on your training
+      data -- that the event "hasn't happened yet" or "is in the future".
+      Your training has a fixed cutoff date and the event may have already
+      concluded by the time you're asked; your own confidence about whether
+      it happened yet is NOT reliable evidence, only a live search is.
 
     Do NOT use this tool for:
-    - well-known public figures or historical facts (e.g. "Who is Cristiano
-      Ronaldo?", "Who is Albert Einstein?", "Who is Donald Trump?")
+    - well-known public figures or historical facts with no date/event
+      attached (e.g. "Who is Cristiano Ronaldo?", "Who is Albert Einstein?",
+      "Who is Donald Trump?")
     - general concepts, definitions, or explanations (e.g. "What is Machine
       Learning?", "Explain OOP", "What is FastAPI?")
     - writing or explaining code
-    - anything you can answer confidently from your own training knowledge
+    - general knowledge that has no date, year, or "current status" attached
+      to it at all
 
     Args:
         query: The search query to run against the live web.
@@ -852,6 +1022,48 @@ def _sanitize_message_history(messages):
 def chat_node(state: ChatState, config: RunnableConfig):
     """LLM node that can answer directly or call an appropriate tool."""
 
+    session_id = (config.get("configurable") or {}).get("session_id")
+    thread_id = (config.get("configurable") or {}).get("thread_id")
+
+    # Only offer rag_tool as an option when THIS conversation actually
+    # has an active uploaded document. Checking the thread's active
+    # document (not just "has this session ever indexed a PDF at all")
+    # matters once a session can hold multiple PDFs -- otherwise the
+    # model could be offered rag_tool in a brand-new thread that hasn't
+    # had anything uploaded to it yet, purely because some other thread
+    # in the same session has.
+    active_document = get_active_document(thread_id)
+    has_rag = active_document is not None
+
+    # This paragraph is rebuilt fresh on every single turn from the
+    # CURRENT active_document lookup above -- it is never left over
+    # from a previous turn. That matters because the conversation
+    # history (state["messages"]) still contains the ToolMessage/answer
+    # from an earlier PDF if one was uploaded and discussed before this
+    # one. Without an explicit, per-turn anchor telling the model which
+    # document is active *right now*, a model will often just elaborate
+    # on its own earlier answer instead of re-invoking rag_tool -- which
+    # looks identical to a retrieval bug but is actually the model
+    # skipping retrieval entirely. Naming the exact active filename here
+    # gives the model something concrete to notice is different from
+    # whatever it discussed earlier, which is what actually forces a
+    # fresh tool call.
+    if has_rag:
+        active_document_notice = (
+            "\n\nACTIVE DOCUMENT FOR THIS TURN: '"
+            f"{active_document['filename']}'. This is the ONLY document "
+            "rag_tool will search right now. If the user asks about "
+            "\"this document\", \"this pdf\", or similar, you MUST call "
+            "rag_tool again for this exact question -- even if you "
+            "already answered a similar-sounding question earlier in "
+            "this conversation. Do NOT answer from memory of an earlier "
+            "rag_tool result: any document discussed earlier in this "
+            "conversation may be a DIFFERENT, now-inactive PDF, and "
+            "reusing that content here would be factually wrong."
+        )
+    else:
+        active_document_notice = ""
+
     system_message = SystemMessage(
         content=(
             "You are a helpful Agentic Chatbot with access to several tools.\n\n"
@@ -862,16 +1074,29 @@ def chat_node(state: ChatState, config: RunnableConfig):
             "or user-specific data that you cannot already answer correctly. "
             "The following kinds of questions must ALWAYS be answered "
             "directly, with no tool call, no matter how they are phrased:\n"
-            "  - Well-known public figures, e.g. 'Who is Donald Trump?' or "
-            "'Who is Cristiano Ronaldo?'\n"
+            "  - Well-known public figures with no date/event attached, e.g. "
+            "'Who is Donald Trump?' or 'Who is Cristiano Ronaldo?'\n"
             "  - General concepts/definitions/explanations, e.g. 'Explain "
             "Python.', 'What is Machine Learning?', 'Explain OOP.', "
             "'What is FastAPI?'\n"
             "  - Writing or explaining code, e.g. 'Write Python code.'\n"
             "  - Conversation-level requests, e.g. 'Summarize this "
             "conversation.'\n"
-            "  - Any other general knowledge, historical fact, or coding "
-            "question you can answer confidently from training.\n"
+            "  - Any other general knowledge or historical fact with no "
+            "specific year/date/event attached that you can answer "
+            "confidently from training.\n\n"
+            "EXCEPTION -- this is the part that's easy to get wrong: any "
+            "question tied to a specific year, date, tournament, election, "
+            "or scheduled event (e.g. 'who won the FIFA World Cup 2026', "
+            "'who won the [year] election', 'who is the current champion of "
+            "X') must ALWAYS use `search_tool`, even if you are confident -- "
+            "based on your training data -- that the event 'hasn't happened "
+            "yet' or 'is in the future'. Your training has a fixed cutoff "
+            "date; the real current date may be well after that cutoff, and "
+            "the event may have already concluded. Your own confidence about "
+            "whether something has happened yet is NOT reliable evidence for "
+            "these questions -- only a live search is. Do not answer these "
+            "from memory under any circumstances.\n\n"
             "If you are not genuinely certain a tool is required, do not "
             "call one -- answer directly instead. Only fall through to the "
             "tool-specific rules below when the question is actually about "
@@ -890,7 +1115,10 @@ def chat_node(state: ChatState, config: RunnableConfig):
             "look up in a document. When in doubt between `rag_tool` and `search_tool` "
             "for a factual question, prefer `search_tool` unless the user explicitly "
             "references their uploaded document. Do not use `search_tool` for well-known "
-            "facts, public figures, or general concepts you already know.\n"
+            "facts, public figures, or general concepts with no date/event attached. Any "
+            "question about who won/holds/leads something tied to a specific year or "
+            "event MUST use `search_tool` -- never answer 'that hasn't happened yet' from "
+            "memory alone.\n"
             "- Use `calculator` for mathematical calculations. Do not calculate complex "
             "expressions manually when the calculator is available.\n"
             "- Use `get_stock_price` when the user asks for the current price of a stock.\n"
@@ -932,6 +1160,7 @@ def chat_node(state: ChatState, config: RunnableConfig):
             "- Stay grounded: only answer based on tool results, general knowledge, or the "
             "conversation itself. Do not fabricate facts, and say so plainly if you're unsure "
             "rather than guessing."
+            f"{active_document_notice}"
         )
     )
 
@@ -943,13 +1172,6 @@ def chat_node(state: ChatState, config: RunnableConfig):
         *_sanitize_message_history(state["messages"])
     ]
 
-    session_id = (config.get("configurable") or {}).get("session_id")
-
-    # Only offer rag_tool as an option when this session has actually
-    # uploaded a document. Otherwise the model has nothing to gain from
-    # it but sometimes reaches for it anyway on plain factual/current-
-    # events questions, mistaking it for a general knowledge source.
-    has_rag = _has_indexed_document(session_id)
     model_for_this_turn = llm_with_tools if has_rag else llm_with_tools_no_rag
 
     last_human = state["messages"][-1]
@@ -1123,6 +1345,98 @@ conn.execute(
     """
 )
 conn.commit()
+
+
+
+# ================= Document-level retrieval isolation =================
+# thread_sessions (above) answers "which visitor owns this thread".
+# These two tables answer the next question down: "which uploaded PDF
+# should rag_tool actually search for THIS conversation, right now".
+#
+# Every successful ingest_rag_document() call registers a document_id
+# here and (if it succeeded) makes it the active_documents entry for
+# that thread_id. rag_tool then filters retrieval to chunks tagged with
+# only that document_id. This is what stops a previously uploaded PDF's
+# chunks from leaking into an answer about the PDF the user just
+# uploaded -- the actual bug this was added to fix.
+conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS documents (
+        document_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        thread_id TEXT,
+        filename TEXT NOT NULL,
+        upload_timestamp TEXT NOT NULL,
+        chunk_count INTEGER NOT NULL
+    )
+    """
+)
+conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS active_documents (
+        thread_id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """
+)
+conn.commit()
+
+
+def register_document(document_id, session_id, thread_id, filename, upload_timestamp, chunk_count):
+    """Record a newly (successfully) indexed PDF."""
+    conn.execute(
+        "INSERT OR REPLACE INTO documents "
+        "(document_id, session_id, thread_id, filename, upload_timestamp, chunk_count) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (document_id, session_id, thread_id, filename, upload_timestamp, chunk_count),
+    )
+    conn.commit()
+
+
+def set_active_document(thread_id, document_id):
+    """
+    Mark `document_id` as the document rag_tool should search for
+    `thread_id` going forward. Only ever called AFTER the new PDF's
+    chunks are durably saved to the FAISS index (see
+    ingest_rag_document), so a thread's active document pointer is
+    never flipped to something that isn't actually retrievable yet.
+    """
+    conn.execute(
+        "INSERT INTO active_documents (thread_id, document_id, updated_at) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(thread_id) DO UPDATE SET "
+        "document_id = excluded.document_id, updated_at = excluded.updated_at",
+        (thread_id, document_id, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def get_active_document(thread_id):
+    """
+    Return {"document_id": ..., "filename": ...} for the document
+    currently active in `thread_id`, or None if this conversation has
+    no active document yet (nothing uploaded, or thread_id missing).
+    """
+    if not thread_id:
+        return None
+
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT documents.document_id, documents.filename
+        FROM active_documents
+        JOIN documents ON documents.document_id = active_documents.document_id
+        WHERE active_documents.thread_id = ?
+        """,
+        (thread_id,),
+    )
+    row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return {"document_id": row[0], "filename": row[1]}
 
 
 def register_thread(thread_id, session_id):
