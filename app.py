@@ -588,8 +588,11 @@ for message in st.session_state["message_history"]:
     # Create either a user chat bubble or assistant chat bubble
     with st.chat_message(message["role"]):
 
-        # Display the message content
-        st.text(message["content"])
+        # Display the message content as rendered Markdown (bold text,
+        # tables, lists, etc. from RAG/tool-derived answers need this to
+        # actually render -- st.text() would show raw "**bold**" and
+        # "| pipe | table |" syntax literally instead of formatting it).
+        st.markdown(message["content"])
 
 
 # ========================= HITL approval interface =========================
@@ -745,7 +748,7 @@ if user_input:
 
     # Display the user's message in the chat interface
     with st.chat_message("user"):
-        st.text(user_input)
+        st.markdown(user_input)
 
     # Pass the current thread ID (for memory) and session ID (for
     # per-user document scoping in rag_tool) to LangGraph
