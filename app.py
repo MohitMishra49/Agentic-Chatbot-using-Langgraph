@@ -683,11 +683,19 @@ if current_thread_has_pending_hitl:
 # This keeps it fixed at the bottom of the screen.
 #
 # accept_file=True adds the attachment button inside the chat input.
-# file_type=["pdf"] allows PDF files only.
+#
+# file_type is intentionally NOT set here. Google Drive's mobile picker
+# sometimes hands the browser a file with a generic/incorrect MIME type
+# (e.g. application/octet-stream) even for a perfectly valid PDF --
+# Streamlit's client-side file_type filter then rejects it outright
+# (shown as a red invalid-file icon on the attachment chip) before our
+# code ever runs. Server-side validation below (the "%PDF-" magic-byte
+# check) already enforces "must be a real PDF" with a clear, friendly
+# error message, so it's safe -- and more reliable across devices/picker
+# apps -- to drop the client-side gate and let that check do the job.
 submission = st.chat_input(
     "Type here",
     accept_file=True,
-    file_type=["pdf"],
 
     # Disable input while waiting for human approval
     disabled=current_thread_has_pending_hitl
@@ -738,16 +746,23 @@ if submission:
 
         if not looks_like_a_real_pdf:
 
-            st.error(
-                f"\"{uploaded_pdf.name}\" was received incomplete "
-                f"({len(raw_pdf_bytes)} bytes) and couldn't be processed. "
-                "This usually happens when a file is picked directly from "
-                "Google Drive before it has fully downloaded to the "
-                "device. Try opening the file once in the Drive app first "
-                "(or downloading it), then upload it here again -- or pick "
-                "it from Files/Downloads (local storage) instead, which "
-                "doesn't have this issue."
-            )
+            if len(raw_pdf_bytes) < 1024:
+                st.error(
+                    f"\"{uploaded_pdf.name}\" was received incomplete "
+                    f"({len(raw_pdf_bytes)} bytes) and couldn't be "
+                    "processed. This usually happens when a file is "
+                    "picked directly from Google Drive before it has "
+                    "fully downloaded to the device. Try opening the "
+                    "file once in the Drive app first (or downloading "
+                    "it), then upload it here again -- or pick it from "
+                    "Files/Downloads (local storage) instead, which "
+                    "doesn't have this issue."
+                )
+            else:
+                st.error(
+                    f"\"{uploaded_pdf.name}\" doesn't look like a valid "
+                    "PDF file. Please upload an actual PDF document."
+                )
 
         else:
 
