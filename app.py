@@ -20,6 +20,8 @@ import streamlit as st
 import uuid
 import tempfile
 import os
+import base64
+from gdrive_picker import gdrive_pdf_picker
 
 
 # Generate a unique thread ID for each new conversation
@@ -677,6 +679,124 @@ if current_thread_has_pending_hitl:
             resume_hitl_execution("no")
 
 
+def process_uploaded_pdf(raw_pdf_bytes, filename):
+    """
+    Validate and ingest a PDF's raw bytes, regardless of where they came
+    from (the chat input's file picker, or the Google Drive picker).
+    Shows the same st.error/st.toast feedback either way.
+    """
+
+    # A real PDF is always at least a few hundred bytes, and the
+    # "%PDF-" header must appear somewhere in roughly the first KB
+    # per the PDF spec (some files have a small amount of leading
+    # junk/whitespace before it).
+    looks_like_a_real_pdf = (
+        len(raw_pdf_bytes) >= 1024
+        and b"%PDF-" in raw_pdf_bytes[:1024]
+    )
+
+    if not looks_like_a_real_pdf:
+
+        if len(raw_pdf_bytes) < 1024:
+            st.error(
+                f"\"{filename}\" was received incomplete "
+                f"({len(raw_pdf_bytes)} bytes) and couldn't be "
+                "processed. This usually happens when a file is "
+                "picked directly from Google Drive before it has "
+                "fully downloaded to the device. Try opening the "
+                "file once in the Drive app first (or downloading "
+                "it), then upload it here again -- or pick it from "
+                "Files/Downloads (local storage) instead, which "
+                "doesn't have this issue."
+            )
+        else:
+            st.error(
+                f"\"{filename}\" doesn't look like a valid "
+                "PDF file. Please upload an actual PDF document."
+            )
+        return
+
+    temporary_file_path = None
+
+    try:
+
+        # Save the uploaded PDF as a temporary local file
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".pdf"
+        ) as temporary_file:
+
+            temporary_file.write(raw_pdf_bytes)
+
+            temporary_file_path = temporary_file.name
+
+        # Call the existing backend RAG ingestion function
+        with st.spinner(
+            f"Processing {filename}..."
+        ):
+
+            ingest_rag_document(
+                temporary_file_path,
+                session_id=st.session_state["session_id"],
+                thread_id=st.session_state["thread_id"],
+                filename=filename
+            )
+
+        # Display PDF processing confirmation
+        st.toast(
+            f"{filename} processed successfully.",
+            icon="✅"
+        )
+
+    except Exception as error:
+
+        # Display PDF processing error
+        st.error(
+            f"PDF processing failed: {error}"
+        )
+
+    finally:
+
+        # Delete the temporary PDF after indexing
+        if (
+            temporary_file_path
+            and os.path.exists(temporary_file_path)
+        ):
+            os.remove(temporary_file_path)
+
+
+# ========================= Google Drive import (optional) =========================
+# Only shown if GOOGLE_PICKER_CLIENT_ID / GOOGLE_PICKER_API_KEY are
+# configured. Downloads the file's bytes directly from the Drive API,
+# sidestepping the phone/browser file-input path that was truncating
+# PDFs picked from Drive's cloud folder view.
+_GOOGLE_PICKER_CLIENT_ID = os.getenv("GOOGLE_PICKER_CLIENT_ID", "")
+_GOOGLE_PICKER_API_KEY = os.getenv("GOOGLE_PICKER_API_KEY", "")
+
+if _GOOGLE_PICKER_CLIENT_ID and _GOOGLE_PICKER_API_KEY:
+
+    drive_pick_result = gdrive_pdf_picker(
+        client_id=_GOOGLE_PICKER_CLIENT_ID,
+        api_key=_GOOGLE_PICKER_API_KEY,
+        key="gdrive_picker"
+    )
+
+    # Only process each pick once -- the component keeps returning the
+    # same dict on every rerun until the user picks a new file, so track
+    # what we've already handled.
+    if (
+        drive_pick_result
+        and drive_pick_result.get("data")
+        and drive_pick_result.get("name") != st.session_state.get("_last_drive_pick")
+    ):
+        st.session_state["_last_drive_pick"] = drive_pick_result["name"]
+
+        process_uploaded_pdf(
+            base64.b64decode(drive_pick_result["data"]),
+            drive_pick_result["name"]
+        )
+
+
 # ========================= Fixed chat input with PDF upload =========================
 
 # Keep st.chat_input directly in the main body.
@@ -721,96 +841,16 @@ if submission:
 
         uploaded_pdf = uploaded_files[0]
 
-        # Store the temporary file path
-        temporary_file_path = None
-
         # Read the raw bytes ONCE up front so we can sanity-check them
         # before doing any real work. Picking a file via Google Drive's
         # in-browser picker (as opposed to local storage/Downloads) can
         # hand the browser a truncated or empty file if Drive hasn't
         # finished streaming it down to the device yet -- the picker UI
         # still shows the correct filename/size, but the actual bytes
-        # received can be incomplete. Catching that here gives a clear,
-        # specific message instead of a confusing low-level PDF parsing
-        # error (or being misdiagnosed as "this PDF is scanned").
-        raw_pdf_bytes = uploaded_pdf.getvalue()
-
-        # A real PDF is always at least a few hundred bytes, and the
-        # "%PDF-" header must appear somewhere in roughly the first KB
-        # per the PDF spec (some files have a small amount of leading
-        # junk/whitespace before it).
-        looks_like_a_real_pdf = (
-            len(raw_pdf_bytes) >= 1024
-            and b"%PDF-" in raw_pdf_bytes[:1024]
-        )
-
-        if not looks_like_a_real_pdf:
-
-            if len(raw_pdf_bytes) < 1024:
-                st.error(
-                    f"\"{uploaded_pdf.name}\" was received incomplete "
-                    f"({len(raw_pdf_bytes)} bytes) and couldn't be "
-                    "processed. This usually happens when a file is "
-                    "picked directly from Google Drive before it has "
-                    "fully downloaded to the device. Try opening the "
-                    "file once in the Drive app first (or downloading "
-                    "it), then upload it here again -- or pick it from "
-                    "Files/Downloads (local storage) instead, which "
-                    "doesn't have this issue."
-                )
-            else:
-                st.error(
-                    f"\"{uploaded_pdf.name}\" doesn't look like a valid "
-                    "PDF file. Please upload an actual PDF document."
-                )
-
-        else:
-
-            try:
-
-                # Save the uploaded PDF as a temporary local file
-                with tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=".pdf"
-                ) as temporary_file:
-
-                    temporary_file.write(raw_pdf_bytes)
-
-                    temporary_file_path = temporary_file.name
-
-                # Call the existing backend RAG ingestion function
-                with st.spinner(
-                    f"Processing {uploaded_pdf.name}..."
-                ):
-
-                    ingest_rag_document(
-                        temporary_file_path,
-                        session_id=st.session_state["session_id"],
-                        thread_id=st.session_state["thread_id"],
-                        filename=uploaded_pdf.name
-                    )
-
-                # Display PDF processing confirmation
-                st.toast(
-                    f"{uploaded_pdf.name} processed successfully.",
-                    icon="✅"
-                )
-
-            except Exception as error:
-
-                # Display PDF processing error
-                st.error(
-                    f"PDF processing failed: {error}"
-                )
-
-            finally:
-
-                # Delete the temporary PDF after indexing
-                if (
-                    temporary_file_path
-                    and os.path.exists(temporary_file_path)
-                ):
-                    os.remove(temporary_file_path)
+        # received can be incomplete. process_uploaded_pdf() catches
+        # that and gives a clear, specific message instead of a
+        # confusing low-level PDF parsing error.
+        process_uploaded_pdf(uploaded_pdf.getvalue(), uploaded_pdf.name)
 
 
 # Run this block after the user submits a text message
