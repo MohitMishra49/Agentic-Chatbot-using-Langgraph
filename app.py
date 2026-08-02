@@ -511,8 +511,27 @@ def switch_to_thread(thread_id):
     # into Streamlit's required message format
     temp_messages = []
 
+    # Tracks an image path seen from a generate_image ToolMessage until
+    # the next assistant message, so it can be attached to that message
+    # the same way the live streaming path does (see generated_image_holder
+    # in the main input-handling block below).
+    pending_image_path = None
+
     # Loop through all saved messages
     for message in messages:
+
+        # ToolMessages aren't displayed directly, but a generate_image
+        # result needs to be captured so its image can be re-attached to
+        # the assistant message that follows it.
+        if isinstance(message, ToolMessage):
+
+            if getattr(message, "name", None) == "generate_image":
+                tool_content = message.content or ""
+
+                if tool_content.startswith("IMAGE_FILE::"):
+                    pending_image_path = tool_content.split("IMAGE_FILE::", 1)[1]
+
+            continue
 
         # Check whether the message was sent by the user
         if isinstance(message, HumanMessage):
@@ -522,15 +541,21 @@ def switch_to_thread(thread_id):
         elif isinstance(message, AIMessage):
             role = "assistant"
 
-        # Ignore other message types, such as ToolMessage
+        # Ignore other message types
         else:
             continue
 
         # Convert the LangChain message into a dictionary
-        temp_messages.append({
+        entry = {
             "role": role,
             "content": message.content
-        })
+        }
+
+        if role == "assistant" and pending_image_path:
+            entry["image_path"] = pending_image_path
+            pending_image_path = None
+
+        temp_messages.append(entry)
 
     # Replace the current UI history with the selected conversation
     st.session_state["message_history"] = temp_messages
@@ -593,6 +618,11 @@ for message in st.session_state["message_history"]:
         # actually render -- st.text() would show raw "**bold**" and
         # "| pipe | table |" syntax literally instead of formatting it).
         st.markdown(message["content"])
+
+        # Re-display a previously generated image, if this message has one
+        image_path = message.get("image_path")
+        if image_path and os.path.exists(image_path):
+            st.image(image_path)
 
 
 # ========================= HITL approval interface =========================
@@ -686,53 +716,86 @@ if submission:
         # Store the temporary file path
         temporary_file_path = None
 
-        try:
+        # Read the raw bytes ONCE up front so we can sanity-check them
+        # before doing any real work. Picking a file via Google Drive's
+        # in-browser picker (as opposed to local storage/Downloads) can
+        # hand the browser a truncated or empty file if Drive hasn't
+        # finished streaming it down to the device yet -- the picker UI
+        # still shows the correct filename/size, but the actual bytes
+        # received can be incomplete. Catching that here gives a clear,
+        # specific message instead of a confusing low-level PDF parsing
+        # error (or being misdiagnosed as "this PDF is scanned").
+        raw_pdf_bytes = uploaded_pdf.getvalue()
 
-            # Save the uploaded PDF as a temporary local file
-            with tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=".pdf"
-            ) as temporary_file:
+        # A real PDF is always at least a few hundred bytes, and the
+        # "%PDF-" header must appear somewhere in roughly the first KB
+        # per the PDF spec (some files have a small amount of leading
+        # junk/whitespace before it).
+        looks_like_a_real_pdf = (
+            len(raw_pdf_bytes) >= 1024
+            and b"%PDF-" in raw_pdf_bytes[:1024]
+        )
 
-                temporary_file.write(
-                    uploaded_pdf.getvalue()
-                )
+        if not looks_like_a_real_pdf:
 
-                temporary_file_path = temporary_file.name
-
-            # Call the existing backend RAG ingestion function
-            with st.spinner(
-                f"Processing {uploaded_pdf.name}..."
-            ):
-
-                ingest_rag_document(
-                    temporary_file_path,
-                    session_id=st.session_state["session_id"],
-                    thread_id=st.session_state["thread_id"],
-                    filename=uploaded_pdf.name
-                )
-
-            # Display PDF processing confirmation
-            st.toast(
-                f"{uploaded_pdf.name} processed successfully.",
-                icon="✅"
-            )
-
-        except Exception as error:
-
-            # Display PDF processing error
             st.error(
-                f"PDF processing failed: {error}"
+                f"\"{uploaded_pdf.name}\" was received incomplete "
+                f"({len(raw_pdf_bytes)} bytes) and couldn't be processed. "
+                "This usually happens when a file is picked directly from "
+                "Google Drive before it has fully downloaded to the "
+                "device. Try opening the file once in the Drive app first "
+                "(or downloading it), then upload it here again -- or pick "
+                "it from Files/Downloads (local storage) instead, which "
+                "doesn't have this issue."
             )
 
-        finally:
+        else:
 
-            # Delete the temporary PDF after indexing
-            if (
-                temporary_file_path
-                and os.path.exists(temporary_file_path)
-            ):
-                os.remove(temporary_file_path)
+            try:
+
+                # Save the uploaded PDF as a temporary local file
+                with tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=".pdf"
+                ) as temporary_file:
+
+                    temporary_file.write(raw_pdf_bytes)
+
+                    temporary_file_path = temporary_file.name
+
+                # Call the existing backend RAG ingestion function
+                with st.spinner(
+                    f"Processing {uploaded_pdf.name}..."
+                ):
+
+                    ingest_rag_document(
+                        temporary_file_path,
+                        session_id=st.session_state["session_id"],
+                        thread_id=st.session_state["thread_id"],
+                        filename=uploaded_pdf.name
+                    )
+
+                # Display PDF processing confirmation
+                st.toast(
+                    f"{uploaded_pdf.name} processed successfully.",
+                    icon="✅"
+                )
+
+            except Exception as error:
+
+                # Display PDF processing error
+                st.error(
+                    f"PDF processing failed: {error}"
+                )
+
+            finally:
+
+                # Delete the temporary PDF after indexing
+                if (
+                    temporary_file_path
+                    and os.path.exists(temporary_file_path)
+                ):
+                    os.remove(temporary_file_path)
 
 
 # Run this block after the user submits a text message
@@ -773,6 +836,15 @@ if user_input:
             "box": None
         }
 
+        # Captures the file path of an image produced by the
+        # generate_image tool during this turn, if any, so it can be
+        # rendered with st.image() after streaming finishes (the actual
+        # image bytes never pass through the LLM's own generated text --
+        # see the "IMAGE_FILE::" sentinel handling below).
+        generated_image_holder = {
+            "path": None
+        }
+
         def ai_only_stream():
 
             # Tracks whether chat_node actually produced any streamed
@@ -805,6 +877,21 @@ if user_input:
                             "name",
                             "tool"
                         )
+
+                        # generate_image returns a sentinel string
+                        # ("IMAGE_FILE::<path>") rather than a URL/base64
+                        # blob, so the LLM never has to reproduce the raw
+                        # image data in its final answer. Capture the path
+                        # here so it can be rendered directly with
+                        # st.image() once streaming finishes.
+                        if tool_name == "generate_image":
+
+                            tool_content = message_chunk.content or ""
+
+                            if tool_content.startswith("IMAGE_FILE::"):
+                                generated_image_holder["path"] = (
+                                    tool_content.split("IMAGE_FILE::", 1)[1]
+                                )
 
                         if status_holder["box"] is None:
 
@@ -893,6 +980,11 @@ if user_input:
             ai_only_stream()
         )
 
+        # Display the generated image (if this turn produced one) right
+        # after the text answer, in the same assistant bubble.
+        if generated_image_holder["path"] and os.path.exists(generated_image_holder["path"]):
+            st.image(generated_image_holder["path"])
+
         # Finalize only if a tool was actually used
         if status_holder["box"] is not None:
 
@@ -918,7 +1010,8 @@ if user_input:
     # Save the complete assistant response in Streamlit session state
     st.session_state["message_history"].append({
         "role": "assistant",
-        "content": ai_message
+        "content": ai_message,
+        "image_path": generated_image_holder["path"]
     })
 
     # ========================= HITL ADDED =========================
