@@ -20,8 +20,7 @@ import streamlit as st
 import uuid
 import tempfile
 import os
-import base64
-from gdrive_picker import gdrive_pdf_picker
+from session_persistence import get_persistent_session_id
 
 
 # Generate a unique thread ID for each new conversation
@@ -30,25 +29,43 @@ def generate_thread_id():
 
 
 # ========================= Multi-user session isolation =========================
-# Every browser tab gets its own session_id. It's stored in the page's URL
-# query params (not just st.session_state) so a page REFRESH keeps the same
-# session_id -- st.session_state alone would not survive a hard reload.
-# Opening the app fresh (no "sid" in the URL) always creates a brand new,
-# independent session, e.g. a different browser or device.
+# Every browser gets its own session_id, persisted in that browser's
+# localStorage -- NOT the URL, and not plain st.session_state alone.
+#
+# Why not the URL (st.query_params): a previous version of this app
+# stored session_id there so it would survive a page refresh, but that
+# made it visible in the address bar -- anyone the URL was shared with
+# inherited the exact same session_id, seeing the original user's
+# threads, PDFs, and chat history. That was a real isolation bug.
+#
+# Why not st.session_state alone: it's correctly private (never
+# shareable), but it does NOT survive a hard page refresh -- a refresh
+# opens a brand-new connection, which Streamlit treats as a brand-new
+# session, wiping session_state and losing the sidebar/history.
+#
+# localStorage is the correct middle ground: it lives only in this
+# visitor's own browser profile for this site, survives refreshes, and
+# is never part of a URL or otherwise transmitted -- there's no way to
+# "share" it to another browser/device via a link.
 def init_session_id():
+
+    # Already resolved earlier in THIS script run (or a previous rerun
+    # in the same live connection) -- nothing more to do.
     if "session_id" in st.session_state:
         return st.session_state["session_id"]
 
-    existing_sid = st.query_params.get("sid")
+    persisted_session_id = get_persistent_session_id(key="session_persistence")
 
-    if existing_sid:
-        session_id = existing_sid
-    else:
-        session_id = str(uuid.uuid4())
-        st.query_params["sid"] = session_id
+    if persisted_session_id is None:
+        # The component's JS hasn't reported back yet -- this happens
+        # for one brief instant on the very first run of a fresh
+        # connection (e.g. right after a page refresh). Halt this run;
+        # the component reporting its value triggers an automatic rerun,
+        # and this function will return normally on that next pass.
+        st.stop()
 
-    st.session_state["session_id"] = session_id
-    return session_id
+    st.session_state["session_id"] = persisted_session_id
+    return persisted_session_id
 
 
 # Add a new thread ID to the conversation list
@@ -681,9 +698,8 @@ if current_thread_has_pending_hitl:
 
 def process_uploaded_pdf(raw_pdf_bytes, filename):
     """
-    Validate and ingest a PDF's raw bytes, regardless of where they came
-    from (the chat input's file picker, or the Google Drive picker).
-    Shows the same st.error/st.toast feedback either way.
+    Validate and ingest a PDF's raw bytes from the chat input's file
+    picker. Shows st.error/st.toast feedback.
     """
 
     # A real PDF is always at least a few hundred bytes, and the
@@ -764,37 +780,6 @@ def process_uploaded_pdf(raw_pdf_bytes, filename):
         ):
             os.remove(temporary_file_path)
 
-
-# ========================= Google Drive import (optional) =========================
-# Only shown if GOOGLE_PICKER_CLIENT_ID / GOOGLE_PICKER_API_KEY are
-# configured. Downloads the file's bytes directly from the Drive API,
-# sidestepping the phone/browser file-input path that was truncating
-# PDFs picked from Drive's cloud folder view.
-_GOOGLE_PICKER_CLIENT_ID = os.getenv("GOOGLE_PICKER_CLIENT_ID", "")
-_GOOGLE_PICKER_API_KEY = os.getenv("GOOGLE_PICKER_API_KEY", "")
-
-if _GOOGLE_PICKER_CLIENT_ID and _GOOGLE_PICKER_API_KEY:
-
-    drive_pick_result = gdrive_pdf_picker(
-        client_id=_GOOGLE_PICKER_CLIENT_ID,
-        api_key=_GOOGLE_PICKER_API_KEY,
-        key="gdrive_picker"
-    )
-
-    # Only process each pick once -- the component keeps returning the
-    # same dict on every rerun until the user picks a new file, so track
-    # what we've already handled.
-    if (
-        drive_pick_result
-        and drive_pick_result.get("data")
-        and drive_pick_result.get("name") != st.session_state.get("_last_drive_pick")
-    ):
-        st.session_state["_last_drive_pick"] = drive_pick_result["name"]
-
-        process_uploaded_pdf(
-            base64.b64decode(drive_pick_result["data"]),
-            drive_pick_result["name"]
-        )
 
 
 # ========================= Fixed chat input with PDF upload =========================
