@@ -2,7 +2,7 @@
 
 An AI-powered Agentic Chatbot built with LangGraph, LangChain, and Streamlit, featuring an automated CI/CD pipeline using GitHub Actions, Docker, Docker Hub, and AWS EC2.
 
-live demo link - http://ec2-3-25-121-104.ap-southeast-2.compute.amazonaws.com:8501/
+live demo link - http://ec2-54-252-167-244.ap-southeast-2.compute.amazonaws.com:8501/
 
 
 
